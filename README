@@ -1,0 +1,5 @@
+WHAT IT IS
+----------
+
+A basic wrapper that given a uri like shm://some/path grabs audio and video
+using a pair of shmsrc's and can be used from playbin or uridecodebin.
