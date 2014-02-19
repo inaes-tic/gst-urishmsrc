@@ -38,7 +38,9 @@
 #endif
 
 #include <gst/gst.h>
+
 #include <string.h>
+#include <glib/gprintf.h>
 
 #include "gsturishmsrc.h"
 
@@ -86,6 +88,12 @@ static void gst_urishmsrc_set_property (GObject * object, guint prop_id,
     const GValue * value, GParamSpec * pspec);
 static void gst_urishmsrc_get_property (GObject * object, guint prop_id,
     GValue * value, GParamSpec * pspec);
+static GstStateChangeReturn gst_urishmsrc_change_state (GstElement *
+    element, GstStateChange transition);
+
+static gboolean gst_urishmsrc_create_sources (GstURIShmsrc * self);
+static gboolean gst_urishmsrc_add_src (GstURIShmsrc *self, const gchar *path);
+
 
 static void
 gst_urishmsrc_src_handler_init (gpointer g_iface, gpointer iface_data)
@@ -135,13 +143,14 @@ gst_urishmsrc_src_set_uri (GstURIHandler * handler, const gchar * uri,
   }
   GST_OBJECT_UNLOCK (self);
 
-  if (strncmp ("shm:", uri, 4) != 0) {
+  if (!g_str_has_prefix(uri, "shm:")) {
     goto invalid_uri;
   }
 
-  uri += 6;
   self->uri = g_strdup (orig_uri);
   ret = TRUE;
+
+  gst_urishmsrc_create_sources (self);
 
 out:
   return ret;
@@ -181,6 +190,9 @@ gst_urishmsrc_class_init (GstURIShmsrcClass * klass)
   gobject_class->set_property = gst_urishmsrc_set_property;
   gobject_class->get_property = gst_urishmsrc_get_property;
 
+  gstelement_class->change_state =
+      GST_DEBUG_FUNCPTR (gst_urishmsrc_change_state);
+
   g_object_class_install_property (gobject_class, PROP_URI,
       g_param_spec_string ("uri",
           "URI",
@@ -208,7 +220,47 @@ static void
 gst_urishmsrc_init (GstURIShmsrc * self)
 {
 
+}
 
+
+static gboolean
+gst_urishmsrc_create_sources (GstURIShmsrc * self)
+{
+  const gchar *basepath = self->uri + 6; //XXX
+  gchar *audiopath = NULL;
+  gchar *videopath = NULL;
+  gboolean has_audio = FALSE;
+  gboolean has_video = FALSE;
+  gboolean is_single = FALSE;
+  gboolean src_ret   = FALSE;
+
+  audiopath = g_strconcat(basepath, "_audio.shm", NULL);
+  videopath = g_strconcat(basepath, "_video.shm", NULL);
+
+  if (g_file_test(basepath, G_FILE_TEST_EXISTS))
+    is_single = TRUE;
+  if (g_file_test(audiopath, G_FILE_TEST_EXISTS))
+    has_audio = TRUE;
+  if (g_file_test(videopath, G_FILE_TEST_EXISTS))
+    has_video = TRUE;
+
+  if (is_single) {
+    if (!gst_urishmsrc_add_src(self, basepath))
+      goto source_failed;
+  } else {
+    if (has_audio)
+      src_ret |= gst_urishmsrc_add_src(self, audiopath);
+    if (has_video)
+      src_ret |= gst_urishmsrc_add_src(self, videopath);
+    if (!src_ret)
+      goto source_failed;
+  }
+
+source_failed:
+//XXX FIXME: proper error handling not included.
+out:
+  g_free(audiopath);
+  g_free(videopath);
 }
 
 static void
@@ -243,6 +295,76 @@ gst_urishmsrc_get_property (GObject * object, guint prop_id,
       break;
   }
 }
+
+static GstStateChangeReturn
+gst_urishmsrc_change_state (GstElement *element, GstStateChange transition)
+{
+  GstStateChangeReturn ret = GST_STATE_CHANGE_FAILURE;
+
+  ret = GST_ELEMENT_CLASS (parent_class)->change_state (element, transition);
+
+  return ret;
+}
+
+static gboolean
+gst_urishmsrc_add_src (GstURIShmsrc *self, const gchar *path)
+{
+  GstPadTemplate *template = NULL;
+  GstElement     *src = NULL;
+  GstElement     *capsfilter = NULL;
+  GstCaps        *caps = NULL;
+  GstPad         *oldpad = NULL;
+  GstPad         *newpad = NULL;
+
+  gchar *capsstr  = NULL;
+  gchar *capspath = NULL;
+  gchar *tmp      = NULL;
+  gboolean ret = FALSE;
+  gsize  size  = strlen(path);
+
+  tmp = g_strndup(path, size-4);
+  capspath = g_strconcat(path, ".caps", NULL);
+  if (!g_file_test(capspath, G_FILE_TEST_EXISTS)) {
+    g_free(capspath);
+    capspath = g_strconcat(tmp, ".caps", NULL);
+  }
+
+  ret = g_file_get_contents(capspath, &capsstr, NULL, NULL);
+  if (!ret) {
+    GST_ERROR_OBJECT (self, "Can't open caps file for: %s", path);
+    goto out;
+  }
+
+  src  = gst_element_factory_make("shmsrc", NULL);
+  g_object_set(src, "socket-path", path, NULL);
+  capsfilter = gst_element_factory_make("capsfilter", NULL);
+
+  gst_bin_add_many(GST_BIN(self), src, capsfilter, NULL);
+  gst_element_link(src, capsfilter);
+
+  caps = gst_caps_from_string(capsstr);
+  g_object_set(capsfilter, "caps", caps, NULL);
+  template = gst_static_pad_template_get(&src_factory);
+
+  oldpad = gst_element_get_static_pad(GST_ELEMENT(capsfilter), "src");
+  newpad = gst_ghost_pad_new_from_template(NULL, oldpad, template);
+
+  gst_element_add_pad(GST_ELEMENT(self), newpad);
+
+out:
+  if (tmp)
+    g_free(tmp);
+  if (capspath)
+    g_free(capspath);
+  if (capsstr)
+    g_free(capsstr);
+  if (template)
+    gst_object_unref(template);
+  if (oldpad)
+    gst_object_unref(oldpad);
+  return ret;
+}
+
 
 /* GstElement vmethod implementations */
 
